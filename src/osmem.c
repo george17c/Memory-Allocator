@@ -12,6 +12,12 @@
 
 void *head;
 
+void align(int *offset)
+{
+	while (*offset % 8 != 0)
+		(*offset)++;
+}
+
 struct block_meta *find_available(struct block_meta **last, size_t size)
 {
 	struct block_meta *p = head;
@@ -19,6 +25,14 @@ struct block_meta *find_available(struct block_meta **last, size_t size)
 	while (p) {
 		if (p->size >= size && p->status == STATUS_FREE)
 			return p;
+
+		if (!p->next && p->status == STATUS_FREE) {
+			align(&size);
+			sbrk(size);
+			p->size += size;
+
+			return p;
+		}
 
 		*last = p;
 		p = p->next;
@@ -29,19 +43,17 @@ struct block_meta *find_available(struct block_meta **last, size_t size)
 struct block_meta *request(struct block_meta *last, size_t size)
 {
 	struct block_meta *block;
-	int offset = size + BLOCK_SIZE;
-
-	while (offset % 8 != 0)
-		offset++;
 
 	if (size >= MMAP_THRESHOLD) {
-		block = mmap(NULL, offset, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		block = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		block->status = STATUS_MAPPED;
 	} else {
 		if (!head)
 			block = sbrk(MMAP_THRESHOLD);
-		else
-			block = sbrk(offset);
+		else {
+			align(&size);
+			block = sbrk(size);
+		}
 		block->status = STATUS_ALLOC;
 	}
 
@@ -52,7 +64,7 @@ struct block_meta *request(struct block_meta *last, size_t size)
 		block->prev = NULL;
 	}
 
-	block->size = offset - BLOCK_SIZE;
+	block->size = size - BLOCK_SIZE;
 	block->next = NULL;
 
 	return block;
@@ -60,33 +72,34 @@ struct block_meta *request(struct block_meta *last, size_t size)
 
 void split_block(struct block_meta *block, size_t size)
 {
-	struct block_meta *new_block = (struct block_meta *)((char *)block + size + BLOCK_SIZE);
+	if (block->size > size + BLOCK_SIZE + 8) {
+		struct block_meta *new = (struct block_meta *)((char *)block + size);
 
-	new_block->size = block->size - size - BLOCK_SIZE;
-	new_block->status = STATUS_FREE;
-	new_block->next = block->next;
-	new_block->prev = block;
-	if (new_block->next)
-		new_block->next->prev = new_block;
+		new->size = block->size - size - BLOCK_SIZE;
+		new->status = STATUS_FREE;
+		new->next = block->next;
+		new->prev = block;
+		if (new->next)
+			new->next->prev = new;
 
-	block->size = size;
-	block->next = new_block;
+		block->size = size - BLOCK_SIZE;
+		block->next = new;
+	}
 }
 
-void merge_adjacent(struct block_meta *block)
+void coalesce(void)
 {
-	if (block->next && block->next->status == STATUS_FREE) {
-		block->size += BLOCK_SIZE + block->next->size;
-		block->next = block->next->next;
-		if (block->next)
-			block->next->prev = block;
-	}
+	struct block_meta *p = head;
 
-	if (block->prev && block->prev->status == STATUS_FREE) {
-		block->prev->size += BLOCK_SIZE + block->size;
-		block->prev->next = block->next;
-		if (block->next)
-			block->next->prev = block->prev;
+	while (p) {
+		if (p->next && p->status == STATUS_FREE && p->next->status == STATUS_FREE) {
+			p->size += BLOCK_SIZE + p->next->size;
+			p->next = p->next->next;
+			if (p->next)
+				p->next->prev = p;
+		} else {
+			p = p->next;
+		}
 	}
 }
 
@@ -95,19 +108,23 @@ void *os_malloc(size_t size)
 	if (size <= 0)
 		return NULL;
 
+	int offset = size + BLOCK_SIZE;
 	struct block_meta *block;
 
+	align(&offset);
+    coalesce();
+
 	if (!head) {
-		block = request(NULL, size);
+		block = request(NULL, offset);
 		head = block;
 	} else {
 		struct block_meta *last = head;
 
 		block = find_available(&last, size);
 		if (!block)
-			block = request(last, size);
-		else if (block->size > size + BLOCK_SIZE)
-			split_block(block, size);
+			block = request(last, offset);
+		else if (block->size > offset)
+			split_block(block, offset);
 	}
 
 	block->status = STATUS_ALLOC;
@@ -126,7 +143,7 @@ void os_free(void *ptr)
 		if (block->size >= MMAP_THRESHOLD)
 			munmap(block, block->size + BLOCK_SIZE);
 		else
-			merge_adjacent(block);
+			coalesce();
 	}
 }
 
