@@ -8,11 +8,11 @@
 
 #define MMAP_THRESHOLD (128 * 1024)
 #define MAP_ANONYMOUS   0x20
-#define BLOCK_SIZE (sizeof(struct block_meta))
+#define META_SIZE (sizeof(struct block_meta))
 
-void *head;
+struct block_meta *head;
 
-void align(int *offset)
+void align(size_t *offset)
 {
 	while (*offset % 8 != 0)
 		(*offset)++;
@@ -26,17 +26,20 @@ struct block_meta *find_available(struct block_meta **last, size_t size)
 		if (p->size >= size && p->status == STATUS_FREE)
 			return p;
 
-		if (!p->next && p->status == STATUS_FREE) {
-			align(&size);
-			sbrk(size);
-			p->size += size;
-
-			return p;
-		}
-
 		*last = p;
 		p = p->next;
 	}
+
+	if (last)
+		p = *last;
+
+	if (p->status == STATUS_FREE && p->size < size) {
+		size_t offset = size - p->size;
+		align(&offset);
+		sbrk(offset);
+		p->size = size;
+	}
+
 	return NULL;
 }
 
@@ -45,26 +48,17 @@ struct block_meta *request(struct block_meta *last, size_t size)
 	struct block_meta *block;
 
 	if (size >= MMAP_THRESHOLD) {
-		block = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		block = mmap(NULL, size + META_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		block->status = STATUS_MAPPED;
 	} else {
-		if (!head)
-			block = sbrk(MMAP_THRESHOLD);
-		else {
-			align(&size);
-			block = sbrk(size);
-		}
+		block = sbrk(size + META_SIZE);
 		block->status = STATUS_ALLOC;
 	}
 
-	if (last) {
-		last->next = block;
-		block->prev = last;
-	} else {
-		block->prev = NULL;
-	}
+	last->next = block;
+	block->prev = last;
 
-	block->size = size - BLOCK_SIZE;
+	block->size = size;
 	block->next = NULL;
 
 	return block;
@@ -72,17 +66,17 @@ struct block_meta *request(struct block_meta *last, size_t size)
 
 void split_block(struct block_meta *block, size_t size)
 {
-	if (block->size > size + BLOCK_SIZE + 8) {
-		struct block_meta *new = (struct block_meta *)((char *)block + size);
+	if (block->size > size + META_SIZE) {
+		struct block_meta *new = (struct block_meta *)((char *)block + size + META_SIZE);
 
-		new->size = block->size - size - BLOCK_SIZE;
+		new->size = block->size - size - META_SIZE;
 		new->status = STATUS_FREE;
 		new->next = block->next;
 		new->prev = block;
 		if (new->next)
 			new->next->prev = new;
 
-		block->size = size - BLOCK_SIZE;
+		block->size = size;
 		block->next = new;
 	}
 }
@@ -93,7 +87,7 @@ void coalesce(void)
 
 	while (p) {
 		if (p->next && p->status == STATUS_FREE && p->next->status == STATUS_FREE) {
-			p->size += BLOCK_SIZE + p->next->size;
+			p->size += META_SIZE + p->next->size;
 			p->next = p->next->next;
 			if (p->next)
 				p->next->prev = p;
@@ -103,31 +97,56 @@ void coalesce(void)
 	}
 }
 
+void prealloc(size_t size)
+{
+	head = sbrk(MMAP_THRESHOLD);
+	head->size = size;
+	head->status = STATUS_ALLOC;
+}
+
+void no_prealloc(size_t size)
+{
+	head = mmap(NULL, size + META_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	head->size = size;
+	head->status = STATUS_MAPPED;
+}
+
 void *os_malloc(size_t size)
 {
 	if (size <= 0)
 		return NULL;
 
-	int offset = size + BLOCK_SIZE;
+	size_t offset = size + META_SIZE;
 	struct block_meta *block;
 
 	align(&offset);
-    coalesce();
+	align(&size);
+	coalesce();
 
 	if (!head) {
-		block = request(NULL, offset);
-		head = block;
+		if (size != MMAP_THRESHOLD)
+			prealloc(size);
+
+		if (size == MMAP_THRESHOLD)
+			no_prealloc(MMAP_THRESHOLD);
+
+		block = head;
+		head->next = head->prev = NULL;
 	} else {
 		struct block_meta *last = head;
 
 		block = find_available(&last, size);
 		if (!block)
-			block = request(last, offset);
-		else if (block->size > offset)
-			split_block(block, offset);
+			block = request(last, size);
+		else if (block->size > size)
+			split_block(block, size);
 	}
 
-	block->status = STATUS_ALLOC;
+	if (size < MMAP_THRESHOLD)
+		block->status = STATUS_ALLOC;
+	else
+		block->status = STATUS_MAPPED;
+
 	return (block + 1);
 }
 
@@ -139,11 +158,19 @@ void os_free(void *ptr)
 	struct block_meta *block = (struct block_meta *)ptr - 1;
 
 	if (block->status != STATUS_FREE) {
-		block->status = STATUS_FREE;
-		if (block->size >= MMAP_THRESHOLD)
-			munmap(block, block->size + BLOCK_SIZE);
-		else
-			coalesce();
+		if (block->status == STATUS_MAPPED) {
+			if (block->prev && block->next) {
+				block->prev->next = block->next;
+				block->next->prev = block->prev;
+			} else if (!block->prev && block->next) {
+				block->next->prev = NULL;
+			} else if (block->prev && !block->next) {
+				block->prev->next = NULL;
+			}
+			munmap(block, block->size + META_SIZE);
+		} else {
+			block->status = STATUS_FREE;
+		}
 	}
 }
 
