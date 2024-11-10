@@ -35,9 +35,13 @@ struct block_meta *find_available(struct block_meta **last, size_t size)
 
 	if (p->status == STATUS_FREE && p->size < size) {
 		size_t offset = size - p->size;
+
 		align(&offset);
 		sbrk(offset);
 		p->size = size;
+		p->status = STATUS_ALLOC;
+
+		return p;
 	}
 
 	return NULL;
@@ -97,18 +101,15 @@ void coalesce(void)
 	}
 }
 
-void prealloc(size_t size)
+void init(size_t size)
 {
-	head = sbrk(MMAP_THRESHOLD);
-	head->size = size;
-	head->status = STATUS_ALLOC;
-}
-
-void no_prealloc(size_t size)
-{
-	head = mmap(NULL, size + META_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	head->size = size;
-	head->status = STATUS_MAPPED;
+	if (size == MMAP_THRESHOLD) {
+		head = mmap(NULL, size + META_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		head->status = STATUS_MAPPED;
+	} else {
+		head = sbrk(MMAP_THRESHOLD);
+		head->status = STATUS_ALLOC;
+	}
 }
 
 void *os_malloc(size_t size)
@@ -116,22 +117,17 @@ void *os_malloc(size_t size)
 	if (size <= 0)
 		return NULL;
 
-	size_t offset = size + META_SIZE;
 	struct block_meta *block;
 
-	align(&offset);
 	align(&size);
 	coalesce();
 
 	if (!head) {
-		if (size != MMAP_THRESHOLD)
-			prealloc(size);
+		init(size);
 
-		if (size == MMAP_THRESHOLD)
-			no_prealloc(MMAP_THRESHOLD);
-
-		block = head;
 		head->next = head->prev = NULL;
+		head->size = size;
+		block = head;
 	} else {
 		struct block_meta *last = head;
 
